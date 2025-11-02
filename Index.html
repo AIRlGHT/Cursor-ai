@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no" />
+<title>Gorilla Tag 2D</title>
+<style>
+  :root { --bg:#0c0f14; --pane:#1f2b3c; --pane2:#2c3e55; --ink:#cdd6e6; --anchor:#bfc7d5; --accent:#ff4d4d; --player:#ff9f1a; }
+  html, body { margin:0; padding:0; background:var(--bg); color:#fff; font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif; height:100%; }
+  #wrap { height:100%; display:flex; align-items:center; justify-content:center; }
+  canvas { background: linear-gradient(#16202e, #0c0f14); box-shadow: 0 8px 30px rgba(0,0,0,0.45); touch-action: none; }
+  #hud {
+    position: fixed; top: 10px; left: 10px; display:flex; gap:14px;
+    background: rgba(0,0,0,0.35); padding:8px 12px; border-radius:10px; backdrop-filter: blur(4px);
+    pointer-events:none; font-weight:600;
+  }
+  #prompt {
+    position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.35); padding:8px 12px; border-radius:10px; pointer-events:none; font-weight:500;
+  }
+  /* Mobile controls */
+  #controls {
+    position: fixed; bottom: 12px; left: 12px; right: 12px; display:flex; justify-content:space-between; gap:12px;
+    pointer-events:auto; user-select:none;
+  }
+  .cluster { display:flex; gap:10px; }
+  .btn {
+    width:68px; height:68px; border-radius:50%; background:#222; color:#fff; display:flex; align-items:center; justify-content:center;
+    font-size:22px; box-shadow: 0 6px 18px rgba(0,0,0,0.45); border:2px solid #333;
+  }
+  .btn:active { transform: scale(0.98); background:#2b2b2b; }
+  .btn.small { width:60px; height:60px; font-size:20px; }
+  @media (min-width: 860px) {
+    #controls { display:none; }
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="960" height="540"></canvas>
+</div>
+
+<div id="hud">
+  <span id="round">Round: 1</span>
+  <span id="timer">Time: 60</span>
+  <span id="score">Score: 0</span>
+  <span id="it">It: Player</span>
+</div>
+<div id="prompt">A/D to lean, Space to pump/jump, Left/Right-click to use arms (or mobile buttons). Tag swaps “It”.</div>
+
+<!-- Mobile controls -->
+<div id="controls">
+  <div class="cluster">
+    <div class="btn" id="left">◀</div>
+    <div class="btn" id="right">▶</div>
+    <div class="btn" id="jump">⤒</div>
+  </div>
+  <div class="cluster">
+    <div class="btn small" id="armL">L</div>
+    <div class="btn small" id="armR">R</div>
+    <div class="btn small" id="brake">■</div>
+  </div>
+</div>
+
+<script>
+// ====== Setup ======
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+const W = canvas.width, H = canvas.height;
+
+const HUD = {
+  round: document.getElementById('round'),
+  timer: document.getElementById('timer'),
+  score: document.getElementById('score'),
+  it: document.getElementById('it'),
+};
+
+// Input state
+const input = {
+  left:false, right:false, up:false, brake:false,
+  armL:false, armR:false,
+  mouseL:false, mouseR:false, mx:W/2, my:H/2,
+};
+
+addEventListener('keydown', e=>{
+  if (e.repeat) return;
+  if (e.key==='a'||e.key==='ArrowLeft') input.left = true;
+  if (e.key==='d'||e.key==='ArrowRight') input.right = true;
+  if (e.key===' '||e.key==='w'||e.key==='ArrowUp') input.up = true;
+  if (e.key==='Shift') input.brake = true;
+});
+addEventListener('keyup', e=>{
+  if (e.key==='a'||e.key==='ArrowLeft') input.left = false;
+  if (e.key==='d'||e.key==='ArrowRight') input.right = false;
+  if (e.key===' '||e.key==='w'||e.key==='ArrowUp') input.up = false;
+  if (e.key==='Shift') input.brake = false;
+});
+canvas.addEventListener('contextmenu', e=>e.preventDefault());
+canvas.addEventListener('mousemove', e=>{
+  const r = canvas.getBoundingClientRect();
+  input.mx = (e.clientX - r.left) * (canvas.width / r.width);
+  input.my = (e.clientY - r.top) * (canvas.height / r.height);
+});
+canvas.addEventListener('mousedown', e=>{
+  if (e.button===0) input.mouseL=true;
+  if (e.button===2) input.mouseR=true;
+});
+addEventListener('mouseup', e=>{
+  if (e.button===0) input.mouseL=false;
+  if (e.button===2) input.mouseR=false;
+});
+
+// Mobile buttons
+function bindBtn(id, key){
+  const el = document.getElementById(id);
+  if (!el) return;
+  const on = ()=> input[key] = true;
+  const off = ()=> input[key] = false;
+  el.addEventListener('touchstart', e=>{ on(); e.preventDefault(); }, {passive:false});
+  el.addEventListener('touchend', e=>{ off(); e.preventDefault(); }, {passive:false});
+  el.addEventListener('mousedown', on);
+  el.addEventListener('mouseup', off);
+  el.addEventListener('mouseleave', off);
+}
+bindBtn('left','left'); bindBtn('right','right'); bindBtn('jump','up');
+bindBtn('armL','armL'); bindBtn('armR','armR'); bindBtn('brake','brake');
+
+// ====== Math utils ======
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+const len = (x,y)=>Math.hypot(x,y);
+const norm = (x,y)=>{const l=len(x,y)||1; return {x:x/l,y:y/l};};
+const mix  = (a,b,t)=>a+(b-a)*t;
+
+// ====== World ======
+const world = {
+  gravity: 1400,
+  airDrag: 0.995,
+  groundDrag: 0.85,
+  maxSpeed: 1200,
+  timeLeft: 60,
+  round: 1,
+  score: 0,
+  anchors: [],
+  platforms: [],
+};
+function addPlatform(x,y,w,h){ world.platforms.push({x,y,w,h}); }
+function addAnchor(x,y){ world.anchors.push({x,y}); }
+
+// Arena layout: platforms + anchor grid
+(function buildArena(){
+  addPlatform(0,H-40,W,40);                      // ground
+  addPlatform(120,H-160,180,24);                 // mid left
+  addPlatform(W-300,H-220,220,24);               // mid right
+  addPlatform(0,220,160,24);                     // upper left shelf
+  addPlatform(W-160,180,160,24);                 // upper right shelf
+  addPlatform(W/2-80,H/2+40,160,24);             // center bar
+  addPlatform(60,120,24,140);                    // left pillar
+  addPlatform(W-84,100,24,160);                  // right pillar
+
+  const rows=4, cols=10;
+  for (let r=0;r<rows;r++){
+    for (let c=0;c<cols;c++){
+      const ax = 60 + c*((W-120)/(cols-1));
+      const ay = 90 + r*90;
+      addAnchor(ax, ay);
+    }
+  }
+})();
+
+// ====== Collision helpers ======
+function circleRectHit(cx,cy,cr, r){
+  const nx = clamp(cx, r.x, r.x+r.w);
+  const ny = clamp(cy, r.y, r.y+r.h);
+  const dx = cx - nx, dy = cy - ny;
+  return dx*dx + dy*dy <= cr*cr;
+}
+function pointRectHit(px,py, r){
+  return px >= r.x && px <= r.x+r.w && py >= r.y && py <= r.y+r.h;
+}
+
+// ====== Gorilla with arms ======
+class Arm {
+  constructor(side){ // side: -1 left, +1 right
+    this.side = side;
+    this.length = 54;
+    this.angle = -Math.PI/2; // start downwards
+    this.active = false;     // pushing / planted
+    this.planted = false;    // hand planted on surface
+    this.handX = 0; this.handY = 0;
+  }
+}
+
+class Gorilla {
+  constructor(x,y,color='#ff9f1a',ai=false,name='Gorilla'){
+    this.x=x; this.y=y; this.vx=0; this.vy=0;
+    this.r=18; this.color=color; this.ai=ai; this.name=name;
+    this.grounded=false; this.wallNX=0;
+    this.isIt=false; this.itCD=0; this.pumpCD=0;
+    this.left = new Arm(-1);
+    this.right = new Arm(+1);
+    this.aim = 0; // look angle
+  }
+  get speed(){ return len(this.vx,this.vy); }
+}
+
+const player = new Gorilla(120,H-80,'#ff9f1a',false,'Player');
+const bots = [
+  new Gorilla(W-160,H-80,'#4dd0e1',true,'Blue'),
+  new Gorilla(W/2,H-300,'#a3e635',true,'Green'),
+];
+player.isIt = true;
+
+// ====== Physics: body collisions ======
+function resolveBody(g){
+  g.grounded=false; g.wallNX=0;
+  for (const p of world.platforms){
+    if (!circleRectHit(g.x,g.y,g.r,p)) continue;
+    const nx = clamp(g.x, p.x, p.x+p.w);
+    const ny = clamp(g.y, p.y, p.y+p.h);
+    const dx = g.x - nx, dy = g.y - ny;
+    const d = Math.hypot(dx,dy)||1, ux = dx/d, uy = dy/d;
+    g.x = nx + ux*(g.r+0.1);
+    g.y = ny + uy*(g.r+0.1);
+    const along = g.vx*ux + g.vy*uy;
+    if (along>0){ g.vx -= ux*along; g.vy -= uy*along; }
+    if (Math.abs(uy)>0.8 && uy<0){ g.grounded=true; g.vy*=world.groundDrag; }
+    if (Math.abs(ux)>0.8){ g.wallNX = Math.sign(ux); g.vx*=0.6; }
+  }
+}
+
+// ====== Arm collision + push/swing ======
+function updateArms(g, dt, control){
+  // Control mapping: for player, use inputs; for bots, AI fills control flags
+  const leftActive  = control.armL;
+  const rightActive = control.armR;
+
+  g.left.active  = leftActive || control.mouseL;
+  g.right.active = rightActive || control.mouseR;
+
+  // Aim: follow mouse for player, target for bots
+  const targetAngle = g.aim;
+  // Slight offset per arm for reach
+  g.left.angle  = mix(g.left.angle,  targetAngle - 0.25, 0.25);
+  g.right.angle = mix(g.right.angle, targetAngle + 0.25, 0.25);
+
+  // Update hand positions
+  const arms = [g.left, g.right];
+  for (const arm of arms){
+    arm.handX = g.x + Math.cos(arm.angle) * (g.r + arm.length);
+    arm.handY = g.y + Math.sin(arm.angle) * (g.r + arm.length);
+
+    // Collide hand with platforms: if hand penetrates, project out and mark planted
+    let planted = false;
+    for (const p of world.platforms){
+      if (!pointRectHit(arm.handX, arm.handY, p)) continue;
+      planted = true;
+      // Push hand out of rect by nearest axis
+      const left = arm.handX - p.x;
+      const right= (p.x+p.w) - arm.handX;
+      const top  = arm.handY - p.y;
+      const bottom= (p.y+p.h) - arm.handY;
+      const min = Math.min(left,right,top,bottom);
+      if (min===left)   arm.handX = p.x;
+      else if (min===right) arm.handX = p.x+p.w;
+      else if (min===top)   arm.handY = p.y;
+      else arm.handY = p.y+p.h;
+      break;
+    }
+    arm.planted = planted;
+
+    // If arm is active and planted, apply push impulse to body
+    if (arm.active && arm.planted){
+      const dirX = g.x - arm.handX;
+      const dirY = g.y - arm.handY;
+      const d = Math.hypot(dirX,dirY)||1;
+      const nx = dirX/d, ny = dirY/d;
+
+      // Push strength depends on alignment and leverage
+      const push = 1800;
+      g.vx += nx * push * dt;
+      g.vy += ny * push * dt;
+
+      // Bonus lateral shove for arm side to feel asymmetric pumping
+      g.vx += arm.side * 260 * dt;
+
+      // Slightly retract body toward hand to simulate compression / plant
+      const rope = g.r + arm.length;
+      const dist = Math.hypot(g.x - arm.handX, g.y - arm.handY);
+      if (dist > rope) {
+        const over = dist - rope;
+        g.x -= nx * over * 0.4;
+        g.y -= ny * over * 0.4;
+      }
+    } else {
+      // If not planted, allow free arm swing: tiny inertial tug toward aim
+      const tug = 90;
+      const ax = Math.cos(arm.angle), ay = Math.sin(arm.angle);
+      g.vx += ax * tug * dt;
+      g.vy += ay * tug * dt;
+    }
+  }
+}
+
+// ====== Movement ======
+function updateAimFromMouse(g){
+  const dx = input.mx - g.x;
+  const dy = input.my - g.y;
+  g.aim = Math.atan2(dy,dx);
+}
+function applyMovement(g, dt, control){
+  // Gravity
+  g.vy += world.gravity * dt;
+
+  // Air/ground control
+  const lean = 900;
+  if (control.left)  g.vx -= lean*dt;
+  if (control.right) g.vx += lean*dt;
+  if (control.brake){ g.vx*=0.92; g.vy*=0.92; }
+
+  // Pump/jump
+  if (control.up){
+    if (g.wallNX && g.pumpCD<=0){
+      g.vx += -g.wallNX * 520; g.vy -= 520 * 0.8; g.pumpCD = 0.18;
+    } else if (g.grounded){
+      g.vy -= 620;
+    }
+  }
+  g.pumpCD = Math.max(0, g.pumpCD - dt);
+
+  // Speed cap
+  const sp = g.speed;
+  if (sp>world.maxSpeed){ const n=norm(g.vx,g.vy); g.vx=n.x*world.maxSpeed; g.vy=n.y*world.maxSpeed; }
+}
+
+function stepGorilla(g, dt, isPlayer, aiControl){
+  const control = isPlayer ? {
+    left: input.left, right: input.right, up: input.up, brake: input.brake,
+    armL: input.armL || input.mouseL, armR: input.armR || input.mouseR,
+    mouseL: input.mouseL, mouseR: input.mouseR,
+  } : aiControl;
+
+  if (isPlayer) updateAimFromMouse(g);
+
+  updateArms(g, dt, control);
+  applyMovement(g, dt, control);
+
+  // Integrate
+  g.x += g.vx*dt; g.y += g.vy*dt;
+
+  // Collisions
+  resolveBody(g);
+
+  // Drag
+  const drag = g.grounded ? world.groundDrag : world.airDrag;
+  g.vx *= drag; g.vy *= drag;
+
+  // Bounds
+  g.x = clamp(g.x, g.r, W-g.r);
+  g.y = clamp(g.y, g.r, H-g.r);
+}
+
+// ====== Tag logic ======
+function tryTag(a,b){
+  if (!a.isIt || a.itCD>0) return false;
+  const rr = (a.r+b.r+6);
+  const dx=a.x-b.x, dy=a.y-b.y;
+  if (dx*dx + dy*dy <= rr*rr){
+    a.isIt=false; b.isIt=true;
+    a.itCD=0.8; b.itCD=0.8;
+    if (a.name==='Player') world.score += 1;
+    if (b.name==='Player') world.score -= 1;
+    shake(7);
+    return true;
+  }
+  return false;
+}
+function updateTags(dt){
+  player.itCD = Math.max(0, player.itCD - dt);
+  for (const b of bots) b.itCD = Math.max(0, b.itCD - dt);
+  for (const b of bots){ tryTag(player,b); tryTag(b,player); }
+}
+
+// ====== Simple AI ======
+function botAI(bot, dt){
+  const others = [player, ...bots.filter(x=>x!==bot)];
+  let target=null;
+  if (bot.isIt) {
+    target = others.filter(e=>!e.isIt).sort((a,b)=>len(a.x-bot.x,a.y-bot.y)-len(b.x-bot.x,b.y-bot.y))[0];
+  } else {
+    target = others.find(e=>e.isIt) || player;
+  }
+  if (!target) target = player;
+
+  // Predict target
+  const tx = mix(target.x, target.x + target.vx*0.35, 0.6);
+  const ty = mix(target.y, target.y + target.vy*0.35, 0.6);
+
+  // Aim toward target with slight upward bias
+  const dx = tx - bot.x, dy = ty - bot.y - 20;
+  bot.aim = Math.atan2(dy,dx);
+
+  // Decide arm use: alternate plants to pump forward
+  const stride = Math.sin(perf*0.002 + (bot.name==='Blue'?0:1.4));
+  const useLeft  = stride > 0;
+  const useRight = stride <= 0;
+
+  const near = Math.hypot(dx,dy);
+  const chase = near > 120;
+
+  const control = {
+    left: Math.sign(dx) < 0,
+    right: Math.sign(dx) > 0,
+    up: bot.wallNX ? (bot.pumpCD<=0) : bot.grounded && Math.random()<0.08,
+    brake: false,
+    armL: useLeft && chase,
+    armR: useRight && chase,
+    mouseL:false, mouseR:false,
+  };
+  return control;
+}
+
+// ====== Camera & render ======
+let camX=0, camY=0, shakeS=0;
+function shake(s){ shakeS = Math.max(shakeS, s); }
+function applyCamera(){
+  const tx = clamp(player.x - W*0.5, 0, W*0.3);
+  const ty = clamp(player.y - H*0.5, 0, H*0.5);
+  camX = mix(camX, tx, 0.08);
+  camY = mix(camY, ty, 0.08);
+  const sx = (Math.random()-0.5) * shakeS;
+  const sy = (Math.random()-0.5) * shakeS;
+  ctx.setTransform(1,0,0,1, -camX + sx, -camY + sy);
+  shakeS = Math.max(0, shakeS - 0.6);
+}
+
+function draw(){
+  ctx.clearRect(-1000,-1000, 3000,3000);
+
+  // Background bands
+  ctx.fillStyle = '#0d1320'; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = '#122033';
+  for (let i=0;i<14;i++){
+    const bw = 80 + i*20;
+    const x = (i*120) % (W+200);
+    ctx.fillRect(x*0.65, 60 + i*28, bw, 6);
+  }
+
+  // Anchors (visual only here)
+  for (const a of world.anchors){
+    ctx.fillStyle = '#bfc7d5';
+    ctx.beginPath(); ctx.arc(a.x,a.y,4,0,Math.PI*2); ctx.fill();
+  }
+
+  // Platforms
+  for (const p of world.platforms){
+    ctx.fillStyle = '#1f2b3c';
+    ctx.fillRect(p.x,p.y,p.w,p.h);
+    ctx.strokeStyle = '#2c3e55';
+    ctx.strokeRect(p.x+0.5,p.y+0.5,p.w-1,p.h-1);
+  }
+
+  // Gorillas
+  const drawG = (g)=>{
+    // Arms
+    const arms = [g.left, g.right];
+    for (const arm of arms){
+      const hx = arm.handX, hy = arm.handY;
+      ctx.strokeStyle = '#cdd6e6';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(g.x, g.y);
+      ctx.lineTo(hx, hy);
+      ctx.stroke();
+
+      // Hand
+      ctx.fillStyle = arm.planted ? '#cde8ff' : '#fff';
+      ctx.beginPath();
+      ctx.arc(hx, hy, 6, 0, Math.PI*2);
+      ctx.fill();
+    }
+
+    // Body (squash by speed)
+    const squash = clamp(g.speed/800, 0, 0.25);
+    const rw = g.r*(1+squash), rh = g.r*(1-squash);
+
+    ctx.save();
+    ctx.translate(g.x, g.y);
+    ctx.fillStyle = g.color;
+    ctx.beginPath(); ctx.ellipse(0,0, rw, rh, 0, 0, Math.PI*2); ctx.fill();
+
+    // Face dot
+    ctx.fillStyle = '#000';
+    ctx.beginPath(); ctx.arc(6,-4, 2.5, 0, Math.PI*2); ctx.fill();
+
+    // "It" ring
+    if (g.isIt){
+      ctx.strokeStyle = '#ff4d4d';
+      ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.ellipse(0,0, rw+4, rh+4, 0, 0, Math.PI*2); ctx.stroke();
+    }
+    ctx.restore();
+  };
+
+  drawG(player); bots.forEach(drawG);
+
+  // HUD
+  HUD.round.textContent = `Round: ${world.round}`;
+  HUD.timer.textContent = `Time: ${Math.ceil(world.timeLeft)}`;
+  HUD.score.textContent = `Score: ${world.score}`;
+  const who = player.isIt ? 'Player' : (bots.find(b=>b.isIt)?.name || 'None');
+  HUD.it.textContent = `It: ${who}`;
+}
+
+// ====== Game loop ======
+let last = performance.now();
+let acc = 0;
+const FIX = 1/120;
+let perf = last;
+
+function frame(now){
+  perf = now;
+  const dt = (now - last)/1000; last = now;
+  acc += dt;
+
+  while (acc >= FIX){
+    // Player control + step
+    const playerAI = {
+      left: input.left, right: input.right, up: input.up, brake: input.brake,
+      armL: input.armL || input.mouseL, armR: input.armR || input.mouseR,
+      mouseL: input.mouseL, mouseR: input.mouseR,
+    };
+    stepGorilla(player, FIX, true, playerAI);
+
+    // Bots
+    for (const b of bots){
+      const ai = botAI(b, FIX);
+      stepGorilla(b, FIX, false, ai);
+    }
+
+    // Tag updates
+    updateTags(FIX);
+
+    // Round timer
+    world.timeLeft -= FIX;
+    if (world.timeLeft <= 0){
+      world.round++;
+      world.timeLeft = 60;
+      const all = [player, ...bots];
+      all.forEach(g => g.isIt=false);
+      const pick = all[Math.floor(Math.random()*all.length)];
+      pick.isIt = true;
+      shake(6);
+    }
+
+    acc -= FIX;
+  }
+
+  applyCamera();
+  draw();
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ====== Responsive scaling ======
+function resize(){
+  const scale = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = `${W*scale}px`;
+  canvas.style.height = `${H*scale}px`;
+}
+addEventListener('resize', resize);
+resize();
+
+// ====== Safety: ensure first touch sets focus on mobile ======
+addEventListener('touchstart', ()=>{ /* no-op, keeps audio policy doors open later */ }, {passive:true});
+</script>
+</body>
+	</html>
